@@ -34,6 +34,8 @@ typedef struct walk_env_t {
 	void *env;
 } walk_env_t;
 
+static int current_stage;
+
 static void walk_expression(expression_t *expr, const walk_env_t *const env);
 static void walk_statement(statement_t *stmt, const walk_env_t *env);
 static void walk_entity(entity_t *entity, const walk_env_t *env);
@@ -366,6 +368,21 @@ static void walk_statement(statement_t *const stmt, const walk_env_t *const env)
 	case STATEMENT_GOTO:
 	case STATEMENT_ASM:
 	case STATEMENT_LEAVE:
+		return;
+
+	case STATEMENT_PIPELINE: {
+		const int old_stage = current_stage;
+		for (current_stage = 0; current_stage < stmt->pipeline.stages; ++current_stage) {
+			walk_statement(stmt->pipeline.body, env);
+		}
+		current_stage = old_stage;
+		return;
+	}
+
+	case STATEMENT_STAGE:
+		if (stmt->stage.index == current_stage) {
+			walk_statement(stmt->stage.body, env);
+		}
 		return;
 	}
 

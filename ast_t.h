@@ -497,8 +497,22 @@ typedef enum statement_kind_t {
 	STATEMENT_FOR,
 	STATEMENT_ASM,
 	STATEMENT_MS_TRY,          /**< MS __try/__finally or __try/__except */
-	STATEMENT_LEAVE            /**< MS __leave */
+	STATEMENT_LEAVE,           /**< MS __leave */
+	STATEMENT_PIPELINE,
+	STATEMENT_STAGE
 } statement_kind_t;
+
+typedef enum stage_direction_t {
+	STAGE_IN,
+	STAGE_OUT
+} stage_direction_t;
+
+struct stage_entity_t {
+	stage_entity_t         *next;
+	reference_expression_t *expression;
+	stage_direction_t       direction;
+	long                    target;
+};
 
 /**
  * The base class of every statement.
@@ -634,6 +648,21 @@ struct leave_statement_t {
 	statement_base_t  base;
 };
 
+struct pipeline_statement_t {
+	statement_base_t  base;
+	statement_t      *body;
+	int               stages;
+	stage_statement_t*first_stage;
+};
+
+struct stage_statement_t {
+	statement_base_t  base;
+	stage_statement_t*next;
+	statement_t      *body;
+	int               index;
+	stage_entity_t   *first_entity;
+};
+
 union statement_t {
 	statement_kind_t         kind;
 	statement_base_t         base;
@@ -652,6 +681,8 @@ union statement_t {
 	asm_statement_t          asms;
 	ms_try_statement_t       ms_try;
 	leave_statement_t        leave;
+	pipeline_statement_t     pipeline;
+	stage_statement_t        stage;
 };
 
 struct translation_unit_t {

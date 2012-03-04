@@ -60,6 +60,7 @@ type_t *type_void_ptr_restrict;
 type_t *type_const_void_ptr_restrict;
 
 type_t *type_char_ptr_ptr;
+type_t *type_char_ptr_ptr_ptr;
 
 type_t *type_intmax_t;
 type_t *type_ptrdiff_t;
@@ -170,6 +171,7 @@ void init_basic_types(void)
 	type_long_long_ptr      = make_pointer_type(type_long_long,         TYPE_QUALIFIER_NONE);
 
 	type_char_ptr_ptr       = make_pointer_type(type_char_ptr,          TYPE_QUALIFIER_NONE);
+	type_char_ptr_ptr_ptr   = make_pointer_type(type_char_ptr_ptr,      TYPE_QUALIFIER_NONE);
 	type_valist             = type_void_ptr;
 
 	/* const character types */

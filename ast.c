@@ -1119,6 +1119,52 @@ static void print_leave_statement(const leave_statement_t *statement)
 }
 
 /**
+ * Print a pipeline statement.
+ *
+ * @param statement   the statement
+ */
+static void print_pipeline_statement(const pipeline_statement_t *statement)
+{
+	print_string("pipeline ");
+	print_statement(statement->body);
+}
+
+/**
+ * Print a stage statement.
+ *
+ * @param statement   the statement
+ */
+static void print_stage_statement(const stage_statement_t *statement)
+{
+	print_string("stage");
+	if (statement->first_entity != NULL) {
+		print_string("(");
+		stage_entity_t *it = statement->first_entity;
+		while (1) {
+			switch (it->direction) {
+			case STAGE_IN:
+				print_string("in ");
+				break;
+			case STAGE_OUT:
+				print_string("out ");
+				break;
+			}
+			print_reference_expression(it->expression);
+
+			it = it->next;
+			if (it == NULL) {
+				break;
+			}
+			print_string(", ");
+		}
+		print_string(")");
+	}
+
+	print_string(" ");
+	print_statement(statement->body);
+}
+
+/**
  * Print a statement.
  *
  * @param statement   the statement
@@ -1179,6 +1225,12 @@ void print_statement(const statement_t *statement)
 		break;
 	case STATEMENT_LEAVE:
 		print_leave_statement(&statement->leave);
+		break;
+	case STATEMENT_PIPELINE:
+		print_pipeline_statement(&statement->pipeline);
+		break;
+	case STATEMENT_STAGE:
+		print_stage_statement(&statement->stage);
 		break;
 	case STATEMENT_ERROR:
 		print_string("$error statement$\n");

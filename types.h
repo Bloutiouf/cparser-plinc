@@ -59,6 +59,7 @@ extern type_t *type_void_ptr_restrict;
 extern type_t *type_const_void_ptr_restrict;
 
 extern type_t *type_char_ptr_ptr;
+extern type_t *type_char_ptr_ptr_ptr;
 
 extern type_t *type_intmax_t;
 extern type_t *type_ptrdiff_t;

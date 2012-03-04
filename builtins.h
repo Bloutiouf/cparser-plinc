@@ -34,7 +34,7 @@ typedef enum {
 	BUILTIN_ROTR,
 	BUILTIN_LIBC,
 	BUILTIN_LIBC_CHECK,
-	BUILTIN_FIRM,
+	BUILTIN_FIRM
 } builtin_kind_t;
 
 /**

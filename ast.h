@@ -24,6 +24,8 @@
 #include <stdbool.h>
 #include "entity.h"
 
+typedef struct stage_entity_t                        stage_entity_t;
+
 typedef struct expression_base_t                     expression_base_t;
 typedef struct literal_expression_t                  literal_expression_t;
 typedef struct string_literal_expression_t           string_literal_expression_t;
@@ -83,6 +85,8 @@ typedef struct asm_clobber_t                         asm_clobber_t;
 typedef struct asm_statement_t                       asm_statement_t;
 typedef struct ms_try_statement_t                    ms_try_statement_t;
 typedef struct leave_statement_t                     leave_statement_t;
+typedef struct pipeline_statement_t                  pipeline_statement_t;
+typedef struct stage_statement_t                     stage_statement_t;
 typedef union  statement_t                           statement_t;
 
 typedef struct translation_unit_t                    translation_unit_t;

@@ -94,6 +94,7 @@ static switch_statement_t  *current_switch    = NULL;
 static statement_t         *current_loop      = NULL;
 static statement_t         *current_parent    = NULL;
 static ms_try_statement_t  *current_try       = NULL;
+static pipeline_statement_t*current_pipeline  = NULL;
 static linkage_kind_t       current_linkage;
 static goto_statement_t    *goto_first        = NULL;
 static goto_statement_t   **goto_anchor       = NULL;
@@ -302,7 +303,9 @@ static size_t get_statement_struct_size(statement_kind_t kind)
 		[STATEMENT_FOR]         = sizeof(for_statement_t),
 		[STATEMENT_ASM]         = sizeof(asm_statement_t),
 		[STATEMENT_MS_TRY]      = sizeof(ms_try_statement_t),
-		[STATEMENT_LEAVE]       = sizeof(leave_statement_t)
+		[STATEMENT_LEAVE]       = sizeof(leave_statement_t),
+		[STATEMENT_PIPELINE]    = sizeof(pipeline_statement_t),
+		[STATEMENT_STAGE]       = sizeof(stage_statement_t)
 	};
 	assert((size_t)kind < lengthof(sizes));
 	assert(sizes[kind] != 0);
@@ -5101,6 +5104,16 @@ found_break_parent:
 			break;
 		}
 
+		case STATEMENT_PIPELINE:
+			check_reachable(stmt->pipeline.body);
+			next = stmt->pipeline.body;
+			break;
+
+		case STATEMENT_STAGE:
+			check_reachable(stmt->stage.body);
+			next = stmt->stage.body;
+			break;
+
 		default:
 			panic("invalid statement kind");
 	}
@@ -5145,6 +5158,8 @@ found_break_parent:
 			case STATEMENT_SWITCH:
 			case STATEMENT_LABEL:
 			case STATEMENT_CASE_LABEL:
+			case STATEMENT_PIPELINE:
+			case STATEMENT_STAGE:
 				last = next;
 				next = next->base.next;
 				break;
@@ -9986,6 +10001,138 @@ end_error:
 	POP_SCOPE();
 }
 
+static statement_t *parse_pipeline(void)
+{
+	statement_t *statement = allocate_statement_zero(STATEMENT_PIPELINE);
+	source_position_t *const pos = &statement->base.source_position;
+
+	eat(T_pipeline);
+
+	PUSH_PARENT(statement);
+
+	statement->pipeline.first_stage = NULL;
+	statement->pipeline.stages = 0;
+
+	pipeline_statement_t *rem  = current_pipeline;
+	current_pipeline           = &statement->pipeline;
+	statement->pipeline.body   = parse_inner_statement();
+	current_pipeline           = rem;
+
+	POP_PARENT();
+
+	if (statement->pipeline.stages == 0) {
+		errorf(pos, "no stage statement within a pipeline statement");
+	} else {
+		/* Bind stages, i.e. find variables' sender and receiver */
+		stage_statement_t *in_stage, *out_stage;
+		stage_entity_t *in_stage_entity, *out_stage_entity;
+		for (in_stage = statement->pipeline.first_stage; in_stage != NULL; in_stage = in_stage->next) {
+			for (in_stage_entity = in_stage->first_entity; in_stage_entity != NULL; in_stage_entity = in_stage_entity->next) {
+				if (in_stage_entity->direction == STAGE_IN) {
+					for (out_stage = statement->pipeline.first_stage; out_stage != NULL; out_stage = out_stage->next) {
+						for (out_stage_entity = out_stage->first_entity; out_stage_entity != NULL; out_stage_entity = out_stage_entity->next) {
+							if (out_stage_entity->expression->entity == in_stage_entity->expression->entity && out_stage_entity->direction == STAGE_OUT) {
+								in_stage_entity->target = out_stage->index;
+								out_stage_entity->target = in_stage->index;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return statement;
+}
+
+static statement_t *parse_stage(void)
+{
+	statement_t *statement = allocate_statement_zero(STATEMENT_STAGE);
+	source_position_t *const pos = &statement->base.source_position;
+
+	eat(T_stage);
+
+	PUSH_PARENT(statement);
+
+	add_anchor_token('{');
+
+	/* Get shared variables */
+	statement->stage.first_entity = NULL;
+	if (next_if('(')) {
+		add_anchor_token(')');
+
+		stage_direction_t direction;
+
+		if (token.kind != ')') {
+			do {
+				if (next_if(T_in)) {
+					direction = STAGE_IN;
+				} else if (next_if(T_out)) {
+					direction = STAGE_OUT;
+				} else {
+					errorf(HERE, "'in' or 'out' expected");
+					goto end_error_anchor;
+				}
+
+				expression_t *expr = parse_reference();
+				if (expr->kind != EXPR_REFERENCE) {
+					errorf(HERE, "reference expected");
+					goto end_error_anchor;
+				}
+
+				expr->reference.entity->variable.address_taken = true;
+
+				/* Push in the list of entities) */
+				stage_entity_t **placeholder = &statement->stage.first_entity;
+				stage_entity_t *it = *placeholder;
+				while (it != NULL) {
+					if (strcmp(expr->reference.entity->base.symbol->string, it->expression->entity->base.symbol->string) < 0) {
+						stage_entity_t *stage_entity = obstack_alloc(&ast_obstack, sizeof(stage_entity_t));
+						stage_entity->next = it;
+						stage_entity->expression = &expr->reference;
+						stage_entity->direction = direction;
+						stage_entity->target = -1;
+						*placeholder = stage_entity;
+						break;
+					}
+					placeholder = &it->next;
+					it = *placeholder;
+				}
+				if (it == NULL) {
+					stage_entity_t *stage_entity = obstack_alloc(&ast_obstack, sizeof(stage_entity_t));
+					stage_entity->next = NULL;
+					stage_entity->expression = &expr->reference;
+					stage_entity->direction = direction;
+					stage_entity->target = -1;
+					*placeholder = stage_entity;
+				}
+			} while (next_if(','));
+		}
+
+end_error_anchor:
+		rem_anchor_token(')');
+		expect(')', end_error);
+end_error:;
+	}
+
+	rem_anchor_token('{');
+
+	if (current_pipeline != NULL) {
+		statement->stage.index = current_pipeline->stages;
+		statement->stage.next = current_pipeline->first_stage;
+		current_pipeline->first_stage = &statement->stage;
+		++current_pipeline->stages;
+	} else {
+		statement->stage.index = -1;
+		errorf(pos, "stage statement not within a pipeline statement");
+	}
+
+	statement->stage.body = parse_inner_statement();
+
+	POP_PARENT();
+	return statement;
+}
+
 /**
  * Parse a statement.
  * There's also parse_statement() which additionally checks for
@@ -10056,8 +10203,10 @@ static statement_t *intern_parse_statement(void)
 	case T_for:       statement = parse_for();                     break;
 	case T_goto:      statement = parse_goto();                    break;
 	case T_if:        statement = parse_if();                      break;
-	case T_return:    statement = parse_return();                  break;
+	case T_pipeline:  statement = parse_pipeline();                break;
+	case T_stage:     statement = parse_stage();                   break;
 	case T_switch:    statement = parse_switch();                  break;
+	case T_return:    statement = parse_return();                  break;
 	case T_while:     statement = parse_while();                   break;
 
 	EXPRESSION_START
@@ -10172,6 +10321,7 @@ static statement_t *parse_compound_statement(bool inside_expression_statement)
 	add_anchor_token(T_long);
 	add_anchor_token(T_new);
 	add_anchor_token(T_operator);
+	add_anchor_token(T_pipeline);
 	add_anchor_token(T_register);
 	add_anchor_token(T_reinterpret_cast);
 	add_anchor_token(T_restrict);
@@ -10179,6 +10329,7 @@ static statement_t *parse_compound_statement(bool inside_expression_statement)
 	add_anchor_token(T_short);
 	add_anchor_token(T_signed);
 	add_anchor_token(T_sizeof);
+	add_anchor_token(T_stage);
 	add_anchor_token(T_static);
 	add_anchor_token(T_static_cast);
 	add_anchor_token(T_struct);
@@ -10271,6 +10422,7 @@ end_error:
 	rem_anchor_token(T_struct);
 	rem_anchor_token(T_static_cast);
 	rem_anchor_token(T_static);
+	rem_anchor_token(T_stage);
 	rem_anchor_token(T_sizeof);
 	rem_anchor_token(T_signed);
 	rem_anchor_token(T_short);
@@ -10278,6 +10430,7 @@ end_error:
 	rem_anchor_token(T_restrict);
 	rem_anchor_token(T_reinterpret_cast);
 	rem_anchor_token(T_register);
+	rem_anchor_token(T_pipeline);
 	rem_anchor_token(T_operator);
 	rem_anchor_token(T_new);
 	rem_anchor_token(T_long);

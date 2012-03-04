@@ -93,9 +93,27 @@ static ir_type            *current_outer_frame;
 static ir_node            *current_static_link;
 static ir_entity          *current_vararg_entity;
 
+static ir_node            *current_pipeline;
+static bool                current_in_stage;
+static long                current_stage_index;
+
 static entitymap_t  entitymap;
 
 static struct obstack asm_obst;
+
+static symconst_symbol rcce_recv;
+static symconst_symbol rcce_send;
+static symconst_symbol plinc_malloc;
+static symconst_symbol plinc_free;
+static symconst_symbol plinc_data;
+static symconst_symbol plinc_size;
+static unsigned sizeof_plinc_size;
+static ir_type *rcce_recv_send_type;
+static ir_type *plinc_serializer_type;
+static ir_type *plinc_deserializer_type;
+static ir_type *plinc_malloc_type;
+static ir_type *plinc_free_type;
+static struct obstack plinc_obst;
 
 typedef enum declaration_kind_t {
 	DECLARATION_KIND_UNKNOWN,
@@ -1795,6 +1813,7 @@ static ir_node *process_builtin_call(const call_expression_t *call)
 	panic("invalid builtin found");
 }
 
+static ir_node *_expression_to_firm(const expression_t *expression);
 /**
  * Transform a call expression.
  * Handles some special cases, like alloca() calls, which must be resolved
@@ -1821,7 +1840,7 @@ static ir_node *call_expression_to_firm(const call_expression_t *const call)
 				firm_builtin = true;
 				firm_builtin_kind = entity->function.b.firm_builtin_kind;
 			} else if (builtin != BUILTIN_NONE && builtin != BUILTIN_LIBC
-			           && builtin != BUILTIN_LIBC_CHECK) {
+					&& builtin != BUILTIN_LIBC_CHECK) {
 				return process_builtin_call(call);
 			}
 		}
@@ -1878,7 +1897,6 @@ static ir_node *call_expression_to_firm(const call_expression_t *const call)
 	for (int n = 0; n < n_parameters; ++n) {
 		expression_t *expression = argument->expression;
 		ir_node      *arg_node   = expression_to_firm(expression);
-
 		type_t *arg_type = skip_typeref(expression->base.type);
 		if (!is_type_compound(arg_type)) {
 			ir_mode *mode = get_ir_mode_storage(expression->base.type);
@@ -3451,8 +3469,10 @@ static ir_node *_expression_to_firm(const expression_t *expression)
 {
 #ifndef NDEBUG
 	if (!constant_folding) {
-		assert(!expression->base.transformed);
-		((expression_t*) expression)->base.transformed = true;
+		if (current_in_stage || current_pipeline == NULL || current_stage_index == 0) {
+			assert(!expression->base.transformed);
+			((expression_t*) expression)->base.transformed = true;
+		}
 	}
 #endif
 
@@ -4558,12 +4578,14 @@ static ir_node *expression_statement_to_firm(expression_statement_t *statement)
 
 static ir_node *compound_statement_to_firm(compound_statement_t *compound)
 {
-	entity_t *entity = compound->scope.entities;
-	for ( ; entity != NULL; entity = entity->base.next) {
-		if (!is_declaration(entity))
-			continue;
+	if (current_in_stage || current_pipeline == NULL || current_stage_index == 0) {
+		entity_t *entity = compound->scope.entities;
+		for ( ; entity != NULL; entity = entity->base.next) {
+			if (!is_declaration(entity))
+				continue;
 
-		create_local_declaration(entity);
+			create_local_declaration(entity);
+		}
 	}
 
 	ir_node     *result    = NULL;
@@ -4873,13 +4895,17 @@ static void do_while_statement_to_firm(do_while_statement_t *statement)
 
 static void for_statement_to_firm(for_statement_t *statement)
 {
-	/* create declarations */
-	entity_t *entity = statement->scope.entities;
-	for ( ; entity != NULL; entity = entity->base.next) {
-		if (!is_declaration(entity))
-			continue;
+	entity_t *entity;
 
-		create_local_declaration(entity);
+	if (current_in_stage || current_pipeline == NULL || current_stage_index == 0) {
+		/* create declarations */
+		entity = statement->scope.entities;
+		for ( ; entity != NULL; entity = entity->base.next) {
+			if (!is_declaration(entity))
+				continue;
+
+			create_local_declaration(entity);
+		}
 	}
 
 	if (currently_reachable()) {
@@ -5358,14 +5384,341 @@ static void leave_statement_to_firm(leave_statement_t *statement)
 	errorf(&statement->base.source_position, "__leave not supported yet");
 }
 
+static void pipeline_statement_to_firm(pipeline_statement_t *statement)
+{
+	ir_node  *first_block = NULL;
+	dbg_info *dbgi        = get_dbg_info(&statement->base.source_position);
+	ir_node  *pipeline_node = NULL;
+	int i;
+
+	if (currently_reachable()) {
+		/* Call procId as switch expression
+		 * TODO does it work? */
+		ir_type *type = new_type_method(0, 1);
+		set_method_res_type(type, 0, new_type_primitive(get_modeIs()));
+
+		ir_entity *entity = new_entity(get_glob_type(), new_id_from_str("_RCCE_ue"), type);
+
+		symconst_symbol symbol;
+		symbol.entity_p = entity;
+
+		ir_node *callee = new_SymConst(get_modeP(), symbol, symconst_addr_ent);
+
+		ir_node *call_node = new_Call(get_store(), callee, 0, NULL, get_entity_type(entity));
+
+		ir_node *mem = new_Proj(call_node, get_modeM(), pn_Call_M);
+		set_store(mem);
+
+		ir_node *tuple = new_Proj(call_node, get_modeT(), pn_Call_T_result);
+		ir_node *expression = new_Proj(tuple, get_modeIs(), 0);
+
+		ir_switch_table *table = ir_new_switch_table(current_ir_graph, statement->stages);
+
+		/* TODO Map cores */
+		for (i = 0; i < statement->stages; ++i) {
+			ir_tarval *index = new_tarval_from_long(i, atomic_modes[ATOMIC_TYPE_INT]);
+			ir_switch_table_set(table, i, index, index, i+1);
+		}
+
+		unsigned n_outs = (unsigned)ir_switch_table_get_n_entries(table) + 1;
+
+		pipeline_node = new_d_Switch(dbgi, expression, n_outs, table);
+		first_block = get_cur_block();
+	}
+
+	set_unreachable_now();
+
+	ir_node *const old_pipeline     = current_pipeline;
+	const bool old_in_stage         = current_in_stage;
+	const long old_stage_index      = current_stage_index;
+	ir_node *const old_break_label  = break_label;
+
+	current_pipeline                = pipeline_node;
+	current_in_stage                = false;
+	break_label                     = NULL;
+
+	for(i = 0; i < statement->stages; ++i) {
+		ir_node *block = new_immBlock();
+
+		ir_node  *const proj = new_Proj(current_pipeline, mode_X, i+1);
+		add_immBlock_pred(block, proj);
+		mature_immBlock(block);
+		set_cur_block(block);
+
+		current_stage_index = i;
+		statement_to_firm(statement->body);
+
+		create_jump_statement(statement->body, get_break_label());
+	}
+
+	set_cur_block(first_block);
+	ir_node *proj = new_d_Proj(dbgi, pipeline_node, mode_X, pn_Switch_default);
+	add_immBlock_pred(get_break_label(), proj);
+
+	if (break_label != NULL) {
+		mature_immBlock(break_label);
+	}
+	set_cur_block(break_label);
+
+	assert(current_pipeline == pipeline_node);
+	current_pipeline    = old_pipeline;
+	current_in_stage    = old_in_stage;
+	current_stage_index = old_stage_index;
+	break_label         = old_break_label;
+}
+
+static void stage_statement_to_firm(stage_statement_t *statement)
+{
+	if (statement->index == current_stage_index) {
+		ir_node *store, *node, *load_data_proj, *load_size_proj, *load_malloc_proj, *load_free_proj;
+		ir_node *in[3];
+
+		store = get_store();
+		for (stage_entity_t *it = statement->first_entity; it != NULL; it = it->next) {
+			if (it->direction == STAGE_IN && it->target >= 0) {
+				ir_node *variable = reference_addr(it->expression);
+				type_t *type = skip_typeref(it->expression->base.type);
+
+				if (is_type_compound(type)) {
+					/* RCCE_recv(&plinc_size, sizeof(plinc_size), target) */
+					in[0] = new_SymConst(get_modeP(), plinc_size, symconst_addr_ent);
+					in[1] = new_Const(new_tarval_from_long(sizeof_plinc_size, atomic_modes[ATOMIC_TYPE_ULONG]));
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					node = new_Call(store, new_SymConst(get_modeP(), rcce_recv, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					/* plinc_data = plinc_malloc(plinc_size) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_malloc, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_malloc_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_size, symconst_addr_ent), get_modeIu(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_size_proj = new_Proj(node, get_modeIu(), pn_Load_res);
+
+					in[0] = load_size_proj;
+
+					node = new_Call(store, load_malloc_proj, 1, in, plinc_malloc_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					ir_node *tuple = new_Proj(node, get_modeT(), pn_Call_T_result);
+					ir_node *result = new_Proj(tuple, get_modeP(), 0);
+
+					node = new_Store(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), result, cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+
+					/* RCCE_recv(plinc_data, plinc_size, 2) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_size, symconst_addr_ent), get_modeIu(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_size_proj = new_Proj(node, get_modeIu(), pn_Load_res);
+
+					in[0] = result;
+					in[1] = load_size_proj;
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					node = new_Call(store, new_SymConst(get_modeP(), rcce_recv, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					/* plinc_deserialize_type(&var, plinc_data, &plinc_size) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_data_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_size, symconst_addr_ent), get_modeIu(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_size_proj = new_Proj(node, get_modeIu(), pn_Load_res);
+
+					obstack_init(&plinc_obst);
+
+					const char *base = "_plinc_deserialize_";
+					obstack_grow(&plinc_obst, base, strlen(base));
+					const char *type_name = type->compound.compound->base.symbol->string;
+					obstack_grow(&plinc_obst, type_name, strlen(type_name));
+					const char* deserializer_name = obstack_finish(&plinc_obst);
+
+					symconst_symbol deserializer_symbol;
+					deserializer_symbol.entity_p = new_entity(get_glob_type(), new_id_from_str(deserializer_name), plinc_deserializer_type);
+					ir_node *serializer_callee = new_SymConst(get_modeP(), deserializer_symbol, symconst_addr_ent);
+
+					in[0] = variable;
+					in[1] = load_data_proj;
+					in[2] = load_size_proj;
+
+					node = new_Call(store, serializer_callee, 3, in, get_entity_type(deserializer_symbol.entity_p));
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					obstack_free(&plinc_obst, NULL);
+
+					/* plinc_free(plinc_data) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_free, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_free_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_data_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					in[0] = load_data_proj;
+
+					node = new_Call(store, load_free_proj, 1, in, plinc_free_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+				} else {
+					/* RCCE_recv(&var, sizeof(var), target) */
+					in[0] = variable;
+					in[1] = get_type_size_node(type);
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					ir_node *call_node = new_Call(store, new_SymConst(get_modeP(), rcce_recv, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(call_node, get_modeM(), pn_Call_M);
+				}
+			}
+		}
+		set_store(store);
+
+		current_in_stage = true;
+		statement_to_firm(statement->body);
+		current_in_stage = false;
+
+		store = get_store();
+		for (stage_entity_t *it = statement->first_entity; it != NULL; it = it->next) {
+			if (it->direction == STAGE_OUT && it->target >= 0) {
+				ir_node *variable = reference_addr(it->expression);
+				type_t *type = skip_typeref(it->expression->base.type);
+
+				if (is_type_compound(type)) {
+					/* plinc_serialize_type(&var, plinc_data, &plinc_size) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_data_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					obstack_init(&plinc_obst);
+
+					const char *base = "_plinc_serialize_";
+					obstack_grow(&plinc_obst, base, strlen(base));
+					const char *type_name = type->compound.compound->base.symbol->string;
+					obstack_grow(&plinc_obst, type_name, strlen(type_name));
+					const char* serializer_name = obstack_finish(&plinc_obst);
+
+					symconst_symbol serializer_symbol;
+					serializer_symbol.entity_p = new_entity(get_glob_type(), new_id_from_str(serializer_name), plinc_serializer_type);
+					ir_node *serializer_callee = new_SymConst(get_modeP(), serializer_symbol, symconst_addr_ent);
+
+					in[0] = variable;
+					in[1] = load_data_proj;
+					in[2] = new_SymConst(get_modeP(), plinc_size, symconst_addr_ent);
+
+					node = new_Call(store, serializer_callee, 3, in, get_entity_type(serializer_symbol.entity_p));
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					obstack_free(&plinc_obst, NULL);
+
+					/* RCCE_send(&plinc_size, sizeof(plinc_size), target) */
+					in[0] = new_SymConst(get_modeP(), plinc_size, symconst_addr_ent);
+					in[1] = new_Const(new_tarval_from_long(sizeof_plinc_size, atomic_modes[ATOMIC_TYPE_ULONG]));
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					node = new_Call(store, new_SymConst(get_modeP(), rcce_send, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					/* RCCE_send(plinc_data, plinc_size, 2) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_data_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_size, symconst_addr_ent), get_modeIu(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_size_proj = new_Proj(node, get_modeIu(), pn_Load_res);
+
+					in[0] = load_data_proj;
+					in[1] = load_size_proj;
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					node = new_Call(store, new_SymConst(get_modeP(), rcce_send, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+
+					/* plinc_free(plinc_data) */
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_free, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_free_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					node = new_Load(store, new_SymConst(get_modeP(), plinc_data, symconst_addr_ent), get_modeP(), cons_none);
+					store = new_Proj(node, get_modeM(), pn_Load_M);
+					load_data_proj = new_Proj(node, get_modeP(), pn_Load_res);
+
+					in[0] = load_data_proj;
+
+					node = new_Call(store, load_free_proj, 1, in, plinc_free_type);
+					store = new_Proj(node, get_modeM(), pn_Call_M);
+				} else {
+					/* RCCE_send(&var, sizeof(var), target) */
+					in[0] = variable;
+					in[1] = get_type_size_node(type);
+					in[2] = new_Const(new_tarval_from_long(it->target, atomic_modes[ATOMIC_TYPE_INT]));
+
+					ir_node *call_node = new_Call(store, new_SymConst(get_modeP(), rcce_send, symconst_addr_ent), 3, in, rcce_recv_send_type);
+					store = new_Proj(call_node, get_modeM(), pn_Call_M);
+				}
+			}
+		}
+		set_store(store);
+	}
+}
+
+/**
+ * Initialize entities required by PLINC.
+ */
+static void plinc_init(void)
+{
+	ir_type *type_void = new_type_primitive(get_modeANY());
+	ir_type *type_int = new_type_primitive(get_modeIs());
+	ir_type *type_size_t = new_type_primitive(get_modeIu());
+	ir_type *type_void_ptr = new_type_pointer(type_void);
+
+	rcce_recv_send_type = new_type_method(3, 1);
+	set_method_param_type(rcce_recv_send_type, 0, type_void_ptr);
+	set_method_param_type(rcce_recv_send_type, 1, type_size_t);
+	set_method_param_type(rcce_recv_send_type, 2, type_int);
+	set_method_res_type(rcce_recv_send_type, 0, type_int);
+
+	rcce_recv.entity_p = new_entity(get_glob_type(), new_id_from_str("_RCCE_recv"), rcce_recv_send_type);
+	rcce_send.entity_p = new_entity(get_glob_type(), new_id_from_str("_RCCE_send"), rcce_recv_send_type);
+
+	plinc_serializer_type = new_type_method(3, 0);
+	set_method_param_type(plinc_serializer_type, 0, type_void_ptr);
+	set_method_param_type(plinc_serializer_type, 1, type_void_ptr);
+	set_method_param_type(plinc_serializer_type, 2, type_void_ptr);
+
+	plinc_deserializer_type = new_type_method(3, 0);
+	set_method_param_type(plinc_deserializer_type, 0, type_void_ptr);
+	set_method_param_type(plinc_deserializer_type, 1, type_void_ptr);
+	set_method_param_type(plinc_deserializer_type, 2, type_size_t);
+
+	plinc_malloc_type = new_type_method(1, 1);
+	set_method_param_type(plinc_malloc_type, 0, type_size_t);
+	set_method_res_type(plinc_malloc_type, 0, type_void_ptr);
+	plinc_malloc.entity_p = new_entity(get_glob_type(), new_id_from_str("_plinc_malloc"), new_type_pointer(plinc_malloc_type));
+
+	plinc_free_type = new_type_method(1, 0);
+	set_method_param_type(plinc_free_type, 0, type_void_ptr);
+	plinc_free.entity_p = new_entity(get_glob_type(), new_id_from_str("_plinc_free"), new_type_pointer(plinc_free_type));
+
+	plinc_data.entity_p = new_entity(get_glob_type(), new_id_from_str("_plinc_data"), type_void_ptr);
+	plinc_size.entity_p = new_entity(get_glob_type(), new_id_from_str("_plinc_size"), type_size_t);
+
+	sizeof_plinc_size = get_atomic_type_size(ATOMIC_TYPE_ULONG);
+}
+
 /**
  * Transform a statement.
  */
 static void statement_to_firm(statement_t *statement)
 {
 #ifndef NDEBUG
-	assert(!statement->base.transformed);
-	statement->base.transformed = true;
+	if (current_in_stage || current_pipeline == NULL || current_stage_index == 0) {
+		assert(!statement->base.transformed);
+		statement->base.transformed = true;
+	}
 #endif
 
 	switch (statement->kind) {
@@ -5424,6 +5777,12 @@ static void statement_to_firm(statement_t *statement)
 		return;
 	case STATEMENT_LEAVE:
 		leave_statement_to_firm(&statement->leave);
+		return;
+	case STATEMENT_PIPELINE:
+		pipeline_statement_to_firm(&statement->pipeline);
+		return;
+	case STATEMENT_STAGE:
+		stage_statement_to_firm(&statement->stage);
 		return;
 	}
 	panic("statement not implemented");
@@ -5878,6 +6237,7 @@ void translation_unit_to_firm(translation_unit_t *unit)
 	/* initialize firm arithmetic */
 	tarval_set_integer_overflow_mode(TV_OVERFLOW_WRAP);
 	ir_set_uninitialized_local_variable_func(uninitialized_local_var);
+	plinc_init();
 
 	/* just to be sure */
 	continue_label           = NULL;
