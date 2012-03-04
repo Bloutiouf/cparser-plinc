@@ -815,35 +815,18 @@ static filetype_t get_filetype_from_string(const char *string)
 	return FILETYPE_UNKNOWN;
 }
 
-static bool is_windows_os(const char *os)
-{
-	return strstr(os, "mingw") != NULL || streq(os, "win32");
-}
-
-static bool is_unixish_os(const char *os)
-{
-	return strstr(os, "linux") != NULL || strstr(os, "bsd") != NULL
-	       || streq(os, "solaris");
-}
-
-static bool is_darwin_os(const char *os)
-{
-	return streq(os, "darwin");
-}
-
 static bool init_os_support(void)
 {
-	const char *os = target_machine->operating_system;
 	wchar_atomic_kind         = ATOMIC_TYPE_INT;
 	enable_main_collect2_hack = false;
 	define_intmax_types       = false;
 
-	if (is_unixish_os(os)) {
+	if (firm_is_unixish_os(target_machine)) {
 		set_create_ld_ident(create_name_linux_elf);
-	} else if (is_darwin_os(os)) {
+	} else if (firm_is_darwin_os(target_machine)) {
 		set_create_ld_ident(create_name_macho);
 		define_intmax_types = true;
-	} else if (is_windows_os(os)) {
+	} else if (firm_is_windows_os(target_machine)) {
 		wchar_atomic_kind         = ATOMIC_TYPE_USHORT;
 		enable_main_collect2_hack = true;
 		set_create_ld_ident(create_name_win32);
@@ -962,8 +945,7 @@ static void init_types_and_adjust(void)
 		set_typeprops_type(&props[ATOMIC_TYPE_ULONGLONG], type_unsigned_long_long);
 
 	/* operating system ABI specifics */
-	const char *os = target_machine->operating_system;
-	if (is_darwin_os(os)) {
+	if (firm_is_darwin_os(target_machine)) {
 		if (machine_size == 32) {
 			props[ATOMIC_TYPE_LONGLONG].struct_alignment    =  4;
 			props[ATOMIC_TYPE_ULONGLONG].struct_alignment   =  4;
@@ -972,7 +954,7 @@ static void init_types_and_adjust(void)
 			props[ATOMIC_TYPE_LONG_DOUBLE].alignment        = 16;
 			props[ATOMIC_TYPE_LONG_DOUBLE].struct_alignment = 16;
 		}
-	} else if (is_windows_os(os)) {
+	} else if (firm_is_windows_os(target_machine)) {
 		if (machine_size == 64) {
 			/* to ease porting of old c-code microsoft decided to use 32bits
 			 * even for long */
@@ -982,7 +964,7 @@ static void init_types_and_adjust(void)
 
 		/* on windows long double is not supported */
 		props[ATOMIC_TYPE_LONG_DOUBLE] = props[ATOMIC_TYPE_DOUBLE];
-	} else if (is_unixish_os(os)) {
+	} else if (firm_is_unixish_os(target_machine)) {
 		if (is_ia32_cpu(target_machine->cpu_type)) {
 			/* System V has a broken alignment for double so we have to add
 			 * a hack here */
@@ -1113,9 +1095,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	const char *target = getenv("TARGET");
-	if (target != NULL)
-		parse_target_triple(target);
 	if (target_machine == NULL) {
 		target_machine = firm_get_host_machine();
 	}
@@ -1449,6 +1428,9 @@ int main(int argc, char **argv)
 					int res = be_parse_arg(arch_opt);
 					if (res == 0)
 						argument_errors = true;
+				} else if (streq(opt, "sse2")) {
+					/* ignore for now, our x86 backend always uses sse when
+					 * sse is requested */
 				} else {
 					long int value = strtol(opt, NULL, 10);
 					if (value == 0) {
@@ -1921,6 +1903,7 @@ do_parsing:
 			if (already_constructed_firm) {
 				panic("compiling multiple files/translation units not possible");
 			}
+			init_implicit_optimizations();
 			translation_unit_to_firm(unit);
 			already_constructed_firm = true;
 			timer_pop(t_construct);
